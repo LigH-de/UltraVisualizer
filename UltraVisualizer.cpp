@@ -290,9 +290,9 @@ public:
 					float R = right_chan[i];
 
 					// Horizontal position: Sine of the difference (R - L)
-					float px = cx + sin(R - L) * max_r;
+					float px = cx + sin(R - L) * /*max_r*/ cx * 0.6f;
 					// Vertical position: Sine of the sum (L + R)
-					float py = cy + sin(L + R) * max_r;
+					float py = cy + sin(L + R) * /*max_r*/ cy * 0.8f;
 					phase_x_pts.push_back(px);
 					phase_y_pts.push_back(py);
 				}
@@ -307,7 +307,7 @@ public:
 					float dist_y = std::abs(py - cy) / cy;
 					float dist_center = std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) / (max_r);
 					BYTE r = static_cast<BYTE>(clamp(dist_y * 255.0f, 0.0f, 255.0f));
-					BYTE g = static_cast<BYTE>(clamp((1.0f - dist_center) * 255.0f, 0.0f, 255.0f));
+					BYTE g = static_cast<BYTE>(clamp(std::sqrt(1.0f - dist_center) * 255.0f, 0.0f, 255.0f));
 					BYTE b = static_cast<BYTE>(clamp(dist_x * 255.0f, 0.0f, 255.0f));
 					DrawLineAA((int)px, (int)py, (int)s_p_x[i + 1], (int)s_p_y[i + 1], r, g, b, 255);
 				}
