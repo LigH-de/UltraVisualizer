@@ -5,6 +5,10 @@ Made with the help of wonkey_monkey (doom9), Columbo (doom9), Gemini (Google), C
 
 Selur contributed an internally multi-threaded version with a pool of buffered overlay frames.
 
+## Syntax
+`visovl = base.UltraVis()` *# RGB24 in, RGB24 out; Prefetch(threads>1) will cause flickering*   \
+`visovl = base.UltraVisMT(threads)` *# internal blur frame buffer avoids flickering*
+
 ### Example videos on YouTube:
 
 Richard Hoffmann: Dreams of Infinity
