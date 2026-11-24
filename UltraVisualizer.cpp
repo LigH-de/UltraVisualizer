@@ -208,6 +208,11 @@ public:
 		internal_buffer.resize(width * height, PixelRGBA{ 0, 0, 0, 0 });
 	}
 
+	int __stdcall SetCacheHints(int cachehints, int frame_range) override
+	{
+		return cachehints == CACHE_GET_MTMODE ? MT_SERIALIZED : 0;
+	}
+
 	PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override
 	{
 		// Fetch the current video frame
