@@ -3,6 +3,8 @@ Visualizer as translucent video overlay filter for Avisynth+, based on a preset 
 
 Made with the help of wonkey_monkey (doom9), Columbo (doom9), Gemini (Google), Claude (Anthropic), and Copilot (Microsoft)
 
+Selur contributed an internally multi-threaded version with a pool of buffered overlay frames.
+
 ### Example videos on YouTube:
 
 Richard Hoffmann: Dreams of Infinity
