@@ -1,5 +1,7 @@
 #include <windows.h>
+#include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <vector>
 #include <map>
@@ -37,6 +39,57 @@ struct PixelRGBA
 using DecayInterior = int (*)(const PixelRGBA* row, const PixelRGBA* up1, const PixelRGBA* dn1,
 	const PixelRGBA* up2, const PixelRGBA* dn2, PixelRGBA* out, int end);
 using OverlayRow = void (*)(BYTE* dst, const PixelRGBA* overlay, int width);
+
+struct LineGradient
+{
+	float start[4], delta[4]; // RGB, with a zero lane for coverage alpha
+};
+
+// A cross section perpendicular to the line's dominant axis.
+struct LineSlice
+{
+	PixelRGBA* origin;
+	int stride, limit;
+	float top, bottom, weight;
+	BYTE alpha;
+
+	template<class Plot>
+	void PlotPixels(Plot plot) const
+	{
+		const int first = static_cast<int>(std::floor(top));
+		const int last = static_cast<int>(std::floor(bottom));
+		auto edge = [&](int pos, float coverage) {
+			if (pos >= 0 && pos < limit && coverage > 0.0f)
+				plot(origin[static_cast<size_t>(pos) * stride], coverage);
+		};
+		if (first == last)
+		{
+			edge(first, (bottom - top) * weight);
+			return;
+		}
+		edge(first, (1.0f - (top - std::floor(top))) * weight);
+		for (int pos = (std::max)(0, first + 1); pos < (std::min)(last, limit); ++pos)
+			plot(origin[static_cast<size_t>(pos) * stride], weight);
+		edge(last, (bottom - std::floor(bottom)) * weight);
+	}
+};
+
+using DrawSlice = void (*)(const LineSlice&, const LineGradient&, float);
+
+static void DrawSliceScalar(const LineSlice& slice, const LineGradient& gradient, float t)
+{
+	auto channel = [&](int i) {
+		return static_cast<BYTE>(clamp(gradient.start[i] + gradient.delta[i] * t + 0.5f, 0.0f, 255.0f));
+	};
+	const BYTE r = channel(0), g = channel(1), b = channel(2);
+	slice.PlotPixels([&](PixelRGBA& dest, float coverage) {
+		const BYTE a = static_cast<BYTE>(clamp(slice.alpha * coverage, 0.0f, 255.0f));
+		dest.r = (std::max)(dest.r, r);
+		dest.g = (std::max)(dest.g, g);
+		dest.b = (std::max)(dest.b, b);
+		dest.a = (std::max)(dest.a, a);
+	});
+}
 
 static void OverlayScalar(BYTE* dst, const PixelRGBA* overlay, int width)
 {
@@ -220,6 +273,35 @@ static UV_KERNEL("avx2") void OverlayAvx2(BYTE* dst, const PixelRGBA* overlay, i
 	OverlayScalar(dst, overlay, width);
 }
 
+static UV_KERNEL("sse2") void DrawSliceSse2(const LineSlice& slice, const LineGradient& gradient, float t)
+{
+	const __m128 start = _mm_loadu_ps(gradient.start), delta = _mm_loadu_ps(gradient.delta);
+#if FLT_EVAL_METHOD > 0 || (defined(_M_IX86) && _M_IX86_FP == 0)
+	// Match x87's wider intermediates, including the final conversion to float before truncation.
+	auto interpolate_pair = [t](__m128 base, __m128 step) UV_TARGET("sse2") {
+		const __m128d scaled = _mm_mul_pd(_mm_cvtps_pd(step), _mm_set1_pd(t));
+		return _mm_cvtpd_ps(_mm_add_pd(_mm_add_pd(_mm_cvtps_pd(base), scaled), _mm_set1_pd(0.5)));
+	};
+	const __m128 lo = interpolate_pair(start, delta);
+	const __m128 hi = interpolate_pair(_mm_movehl_ps(start, start), _mm_movehl_ps(delta, delta));
+	const __m128 rounded = _mm_movelh_ps(lo, hi);
+#else
+	const __m128 color = _mm_add_ps(start, _mm_mul_ps(delta, _mm_set1_ps(t)));
+	const __m128 rounded = _mm_add_ps(color, _mm_set1_ps(0.5f));
+#endif
+	const __m128i channels = _mm_cvttps_epi32(rounded);
+	const __m128i words = _mm_packs_epi32(channels, _mm_setzero_si128());
+	const __m128i rgb = _mm_packus_epi16(words, _mm_setzero_si128());
+	slice.PlotPixels([&](PixelRGBA& dest, float coverage) UV_TARGET("sse2") {
+		const int a = static_cast<int>(clamp(slice.alpha * coverage, 0.0f, 255.0f));
+		const __m128i rgba = _mm_or_si128(rgb, _mm_slli_epi32(_mm_cvtsi32_si128(a), 24));
+		int pixel;
+		std::memcpy(&pixel, &dest, sizeof(pixel));
+		pixel = _mm_cvtsi128_si32(_mm_max_epu8(_mm_cvtsi32_si128(pixel), rgba));
+		std::memcpy(&dest, &pixel, sizeof(pixel));
+	});
+}
+
 #undef UV_TARGET
 #undef UV_KERNEL
 #endif
@@ -228,17 +310,18 @@ struct PixelKernels
 {
 	DecayInterior decay;
 	OverlayRow overlay;
+	DrawSlice draw_slice;
 };
 
 static PixelKernels SelectPixelKernels(int cpu_flags)
 {
 #ifdef ULTRAVIS_X86
 	if (cpu_flags & CPUF_AVX2)
-		return { DecayAvx2, OverlayAvx2 };
+		return { DecayAvx2, OverlayAvx2, DrawSliceSse2 };
 	if (cpu_flags & CPUF_SSE2)
-		return { DecaySse2, OverlaySse2 };
+		return { DecaySse2, OverlaySse2, DrawSliceSse2 };
 #endif
-	return { nullptr, OverlayScalar };
+	return { nullptr, OverlayScalar, DrawSliceScalar };
 }
 
 // Helper function for color calculation of the frequency splines via cosine functions
@@ -569,24 +652,6 @@ class UltraVisualizerMT : public GenericVideoFilter
 		if (line_thickness <= 0.0f)
 			return;
 
-		auto plot = [&](int x, int y, float alpha_factor, float t) {
-			if (x >= 0 && x < width && y >= 0 && y < height && alpha_factor > 0.0f)
-			{
-				PixelRGBA& dest = internal_buffer[static_cast<size_t>(y) * width + x];
-				BYTE target_a = static_cast<BYTE>(clamp(a * alpha_factor, 0.0f, 255.0f));
-				BYTE r = static_cast<BYTE>(clamp(r0 + (r1 - r0) * t + 0.5f, 0.0f, 255.0f));
-				BYTE g = static_cast<BYTE>(clamp(g0 + (g1 - g0) * t + 0.5f, 0.0f, 255.0f));
-				BYTE b = static_cast<BYTE>(clamp(b0 + (b1 - b0) * t + 0.5f, 0.0f, 255.0f));
-
-				// Blending using maximum for each channel separately
-				dest.r = (std::max)(dest.r, r);
-				dest.g = (std::max)(dest.g, g);
-				dest.b = (std::max)(dest.b, b);
-				dest.a = (std::max)(dest.a, target_a);
-			}
-		};
-
-		auto ipart = [](float x) -> int { return static_cast<int>(std::floor(x)); };
 		auto fpart = [](float x) -> float { return x - std::floor(x); };
 		auto rfpart = [&](float x) -> float { return 1.0f - fpart(x); };
 
@@ -613,41 +678,17 @@ class UltraVisualizerMT : public GenericVideoFilter
 		float cos_theta = 1.0f / std::sqrt(1.0f + gradient * gradient);
 		float half_w = 0.5f * (line_thickness / cos_theta);
 
+		const LineGradient colors = {
+			{ float(r0), float(g0), float(b0), 0.0f },
+			{ float(r1 - r0), float(g1 - g0), float(b1 - b0), 0.0f }
+		};
 		auto draw_slice = [&](int x, float y_center, float x_weight, float t) {
-			if (x_weight <= 0.0f)
+			if (x_weight <= 0.0f || x < 0 || x >= (steep ? height : width))
 				return;
-			float y_top = y_center - half_w;
-			float y_bot = y_center + half_w;
-			int y_start = ipart(y_top);
-			int y_end = ipart(y_bot);
-
-			if (y_start == y_end)
-			{
-				float cov = (y_bot - y_top) * x_weight;
-				if (steep)
-					plot(y_start, x, cov, t);
-				else
-					plot(x, y_start, cov, t);
-				return;
-			}
-
-			float cov_top = rfpart(y_top) * x_weight;
-			float cov_bot = fpart(y_bot) * x_weight;
-
-			if (steep)
-			{
-				plot(y_start, x, cov_top, t);
-				for (int y = y_start + 1; y < y_end; ++y)
-					plot(y, x, x_weight, t);
-				plot(y_end, x, cov_bot, t);
-			}
-			else
-			{
-				plot(x, y_start, cov_top, t);
-				for (int y = y_start + 1; y < y_end; ++y)
-					plot(x, y, x_weight, t);
-				plot(x, y_end, cov_bot, t);
-			}
+			PixelRGBA* origin = internal_buffer.data() + (steep ? static_cast<size_t>(x) * width : x);
+			const LineSlice slice = { origin, steep ? 1 : width, steep ? width : height,
+				y_center - half_w, y_center + half_w, x_weight, a };
+			kernels.draw_slice(slice, colors, t);
 		};
 
 		// Handle first endpoint
