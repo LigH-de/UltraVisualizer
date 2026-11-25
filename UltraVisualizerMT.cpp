@@ -10,6 +10,11 @@
 #include <condition_variable>
 #include "avisynth.h"
 
+#if !defined(_M_ARM64EC) && (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__))
+#define ULTRAVIS_X86
+#include <immintrin.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -28,10 +33,106 @@ struct PixelRGBA
 	BYTE r, g, b, a;
 };
 
+// Process complete SIMD blocks in [2, end) and return the start of the scalar tail.
+using DecayInterior = int (*)(const PixelRGBA* row, const PixelRGBA* up1, const PixelRGBA* dn1,
+	const PixelRGBA* up2, const PixelRGBA* dn2, PixelRGBA* out, int end);
+
+#ifdef ULTRAVIS_X86
+static_assert(sizeof(PixelRGBA) == 4, "SIMD blur requires packed RGBA");
+
+// Keep the rest of this translation unit at the target baseline (MSVC Win32: /arch:IA32).
+// MSVC lowers explicit intrinsics without a global /arch:AVX2 switch.
+#if defined(__clang__) || defined(__GNUC__)
+#define UV_TARGET(isa) __attribute__((target(isa)))
+#define UV_KERNEL(isa) UV_TARGET(isa) __attribute__((noinline))
+#else
+#define UV_TARGET(isa)
+#define UV_KERNEL(isa) __declspec(noinline)
+#endif
+
+// Each sum is at most 4 * 255. For this range mulhi(sum, ceil(65536 / d))
+// is exact integer division by d (RGB: 8, near alpha: 10, far alpha: 12).
+static UV_KERNEL("sse2") int DecaySse2(const PixelRGBA* row, const PixelRGBA* up1, const PixelRGBA* dn1,
+	const PixelRGBA* up2, const PixelRGBA* dn2, PixelRGBA* out, int end)
+{
+	auto sum4 = [](const PixelRGBA* a, const PixelRGBA* b, const PixelRGBA* c, const PixelRGBA* d,
+		__m128i& lo, __m128i& hi) UV_TARGET("sse2") {
+		const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a));
+		const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b));
+		const __m128i vc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c));
+		const __m128i vd = _mm_loadu_si128(reinterpret_cast<const __m128i*>(d));
+		const __m128i zero = _mm_setzero_si128();
+		lo = _mm_add_epi16(_mm_add_epi16(_mm_unpacklo_epi8(va, zero), _mm_unpacklo_epi8(vb, zero)),
+			_mm_add_epi16(_mm_unpacklo_epi8(vc, zero), _mm_unpacklo_epi8(vd, zero)));
+		hi = _mm_add_epi16(_mm_add_epi16(_mm_unpackhi_epi8(va, zero), _mm_unpackhi_epi8(vb, zero)),
+			_mm_add_epi16(_mm_unpackhi_epi8(vc, zero), _mm_unpackhi_epi8(vd, zero)));
+	};
+	const __m128i near_scale = _mm_set_epi16(6554, 8192, 8192, 8192, 6554, 8192, 8192, 8192);
+	const __m128i far_scale = _mm_set_epi16(5462, 8192, 8192, 8192, 5462, 8192, 8192, 8192);
+	int x = 2;
+	for (; x <= end - 4; x += 4)
+	{
+		__m128i near_lo, near_hi, far_lo, far_hi;
+		sum4(up1 + x - 1, up1 + x + 1, dn1 + x - 1, dn1 + x + 1, near_lo, near_hi);
+		sum4(up2 + x, dn2 + x, row + x - 2, row + x + 2, far_lo, far_hi);
+		const __m128i lo = _mm_add_epi16(_mm_mulhi_epu16(near_lo, near_scale), _mm_mulhi_epu16(far_lo, far_scale));
+		const __m128i hi = _mm_add_epi16(_mm_mulhi_epu16(near_hi, near_scale), _mm_mulhi_epu16(far_hi, far_scale));
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(out + x), _mm_packus_epi16(lo, hi));
+	}
+	return x;
+}
+
+static UV_KERNEL("avx2") int DecayAvx2(const PixelRGBA* row, const PixelRGBA* up1, const PixelRGBA* dn1,
+	const PixelRGBA* up2, const PixelRGBA* dn2, PixelRGBA* out, int end)
+{
+	auto sum4 = [](const PixelRGBA* a, const PixelRGBA* b, const PixelRGBA* c, const PixelRGBA* d,
+		__m256i& lo, __m256i& hi) UV_TARGET("avx2") {
+		const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
+		const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
+		const __m256i vc = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c));
+		const __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d));
+		const __m256i zero = _mm256_setzero_si256();
+		lo = _mm256_add_epi16(_mm256_add_epi16(_mm256_unpacklo_epi8(va, zero), _mm256_unpacklo_epi8(vb, zero)),
+			_mm256_add_epi16(_mm256_unpacklo_epi8(vc, zero), _mm256_unpacklo_epi8(vd, zero)));
+		hi = _mm256_add_epi16(_mm256_add_epi16(_mm256_unpackhi_epi8(va, zero), _mm256_unpackhi_epi8(vb, zero)),
+			_mm256_add_epi16(_mm256_unpackhi_epi8(vc, zero), _mm256_unpackhi_epi8(vd, zero)));
+	};
+	const __m256i near_scale = _mm256_broadcastsi128_si256(_mm_set_epi16(6554, 8192, 8192, 8192, 6554, 8192, 8192, 8192));
+	const __m256i far_scale = _mm256_broadcastsi128_si256(_mm_set_epi16(5462, 8192, 8192, 8192, 5462, 8192, 8192, 8192));
+	int x = 2;
+	for (; x <= end - 8; x += 8)
+	{
+		__m256i near_lo, near_hi, far_lo, far_hi;
+		sum4(up1 + x - 1, up1 + x + 1, dn1 + x - 1, dn1 + x + 1, near_lo, near_hi);
+		sum4(up2 + x, dn2 + x, row + x - 2, row + x + 2, far_lo, far_hi);
+		const __m256i lo = _mm256_add_epi16(_mm256_mulhi_epu16(near_lo, near_scale), _mm256_mulhi_epu16(far_lo, far_scale));
+		const __m256i hi = _mm256_add_epi16(_mm256_mulhi_epu16(near_hi, near_scale), _mm256_mulhi_epu16(far_hi, far_scale));
+		_mm256_storeu_si256(reinterpret_cast<__m256i*>(out + x), _mm256_packus_epi16(lo, hi));
+	}
+	_mm256_zeroupper();
+	return x;
+}
+
+#undef UV_TARGET
+#undef UV_KERNEL
+#endif
+
+static DecayInterior SelectDecayInterior(int cpu_flags)
+{
+#ifdef ULTRAVIS_X86
+	if (cpu_flags & CPUF_AVX2)
+		return DecayAvx2;
+	if (cpu_flags & CPUF_SSE2)
+		return DecaySse2;
+#endif
+	return nullptr;
+}
+
 // Helper function for color calculation of the frequency splines via cosine functions
 void
 GetSpectrumColor(float progress, BYTE& r, BYTE& g, BYTE& b)
 {
+	using std::cos;
 	// progress runs from 0.0 (bottom/low frequencies) to 1.0 (top/high frequencies)
 	float angle = (1.0f - progress) * 5.0f + ((float)M_PI * 2.0f - 5.0f);
 	r = static_cast<BYTE>(clamp((cos(angle) * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
@@ -266,6 +367,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 
 	int width, height;
 	float line_thickness;
+	const DecayInterior decay_interior;
 	std::vector<PixelRGBA> internal_buffer; // Internal storage clip in RGBA32 format
 	std::vector<PixelRGBA> next_buffer;
 	std::map<int, SpectrumPlan> plans;
@@ -656,7 +758,8 @@ class UltraVisualizerMT : public GenericVideoFilter
 				int inner_end = width - 2;
 				for (int x = 0; x < (std::min)(2, width); ++x)
 					edge(x);
-				for (int x = 2; x < inner_end; ++x)
+				int x = decay_interior ? decay_interior(row, up1, dn1, up2, dn2, out, inner_end) : 2;
+				for (; x < inner_end; ++x)
 					blend(up1[x - 1], up1[x + 1], dn1[x - 1], dn1[x + 1], up2[x], dn2[x], row[x - 2], row[x + 2], out[x]);
 				for (int x = (std::max)(2, inner_end); x < width; ++x)
 					edge(x);
@@ -706,7 +809,8 @@ class UltraVisualizerMT : public GenericVideoFilter
 
 public:
 	UltraVisualizerMT(PClip _child, int threads, float thickness, IScriptEnvironment* env)
-		: GenericVideoFilter(_child), line_thickness(clamp(thickness, 0.1f, 64.0f)), pool(AutoThreads(threads))
+		: GenericVideoFilter(_child), line_thickness(clamp(thickness, 0.1f, 64.0f)),
+		  decay_interior(SelectDecayInterior(env->GetCPUFlags())), pool(AutoThreads(threads))
 	{
 		if (!vi.HasVideo())
 		{
