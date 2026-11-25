@@ -265,6 +265,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 	static const size_t MAX_PLANS = 16;
 
 	int width, height;
+	float line_thickness;
 	std::vector<PixelRGBA> internal_buffer; // Internal storage clip in RGBA32 format
 	std::vector<PixelRGBA> next_buffer;
 	std::map<int, SpectrumPlan> plans;
@@ -346,15 +347,21 @@ class UltraVisualizerMT : public GenericVideoFilter
 #endif
 	}
 
-	// Function to draw a line with ~2px thickness using Xiaolin Wu's anti-aliasing algorithm and maximum blending
+	// Function to draw a line with variable thickness using Xiaolin Wu's anti-aliasing algorithm, linear color gradient and maximum blending
 	void
-		DrawLineAA(float x0, float y0, float x1, float y1, BYTE r, BYTE g, BYTE b, BYTE a)
+		DrawLineAA(float x0, float y0, float x1, float y1, BYTE r0, BYTE g0, BYTE b0, BYTE r1, BYTE g1, BYTE b1, BYTE a)
 	{
-		auto plot = [&](int x, int y, float alpha_factor) {
+		if (line_thickness <= 0.0f)
+			return;
+
+		auto plot = [&](int x, int y, float alpha_factor, float t) {
 			if (x >= 0 && x < width && y >= 0 && y < height && alpha_factor > 0.0f)
 			{
 				PixelRGBA& dest = internal_buffer[static_cast<size_t>(y) * width + x];
 				BYTE target_a = static_cast<BYTE>(clamp(a * alpha_factor, 0.0f, 255.0f));
+				BYTE r = static_cast<BYTE>(clamp(r0 + (r1 - r0) * t + 0.5f, 0.0f, 255.0f));
+				BYTE g = static_cast<BYTE>(clamp(g0 + (g1 - g0) * t + 0.5f, 0.0f, 255.0f));
+				BYTE b = static_cast<BYTE>(clamp(b0 + (b1 - b0) * t + 0.5f, 0.0f, 255.0f));
 
 				// Blending using maximum for each channel separately
 				dest.r = (std::max)(dest.r, r);
@@ -362,7 +369,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 				dest.b = (std::max)(dest.b, b);
 				dest.a = (std::max)(dest.a, target_a);
 			}
-			};
+		};
 
 		auto ipart = [](float x) -> int { return static_cast<int>(std::floor(x)); };
 		auto fpart = [](float x) -> float { return x - std::floor(x); };
@@ -378,32 +385,62 @@ class UltraVisualizerMT : public GenericVideoFilter
 		{
 			std::swap(x0, x1);
 			std::swap(y0, y1);
+			std::swap(r0, r1);
+			std::swap(g0, g1);
+			std::swap(b0, b1);
 		}
 
 		float dx = x1 - x0;
 		float dy = y1 - y0;
 		float gradient = (dx == 0.0f) ? 1.0f : dy / dx;
 
+		// Adjust thickness perpendicular to the dominant axis to preserve perceived stroke width
+		float cos_theta = 1.0f / std::sqrt(1.0f + gradient * gradient);
+		float half_w = 0.5f * (line_thickness / cos_theta);
+
+		auto draw_slice = [&](int x, float y_center, float x_weight, float t) {
+			if (x_weight <= 0.0f)
+				return;
+			float y_top = y_center - half_w;
+			float y_bot = y_center + half_w;
+			int y_start = ipart(y_top);
+			int y_end = ipart(y_bot);
+
+			if (y_start == y_end)
+			{
+				float cov = (y_bot - y_top) * x_weight;
+				if (steep)
+					plot(y_start, x, cov, t);
+				else
+					plot(x, y_start, cov, t);
+				return;
+			}
+
+			float cov_top = rfpart(y_top) * x_weight;
+			float cov_bot = fpart(y_bot) * x_weight;
+
+			if (steep)
+			{
+				plot(y_start, x, cov_top, t);
+				for (int y = y_start + 1; y < y_end; ++y)
+					plot(y, x, x_weight, t);
+				plot(y_end, x, cov_bot, t);
+			}
+			else
+			{
+				plot(x, y_start, cov_top, t);
+				for (int y = y_start + 1; y < y_end; ++y)
+					plot(x, y, x_weight, t);
+				plot(x, y_end, cov_bot, t);
+			}
+		};
+
 		// Handle first endpoint
 		float xend = std::round(x0);
 		float yend = y0 + gradient * (xend - x0);
 		float xgap = rfpart(x0 + 0.5f);
 		int xpxl1 = static_cast<int>(xend);
-		int ypxl1 = ipart(yend - 0.5f);
-		float f1 = fpart(yend - 0.5f);
-
-		if (steep)
-		{
-			plot(ypxl1, xpxl1, (1.0f - f1 * 0.5f) * xgap);
-			plot(ypxl1 + 1, xpxl1, xgap);
-			plot(ypxl1 + 2, xpxl1, (0.5f + f1 * 0.5f) * xgap);
-		}
-		else
-		{
-			plot(xpxl1, ypxl1, (1.0f - f1 * 0.5f) * xgap);
-			plot(xpxl1, ypxl1 + 1, xgap);
-			plot(xpxl1, ypxl1 + 2, (0.5f + f1 * 0.5f) * xgap);
-		}
+		draw_slice(xpxl1, yend, xgap, 0.0f);
 
 		float intery = yend + gradient; // First y-intersection for the main loop
 
@@ -412,46 +449,17 @@ class UltraVisualizerMT : public GenericVideoFilter
 		yend = y1 + gradient * (xend - x1);
 		xgap = fpart(x1 + 0.5f);
 		int xpxl2 = static_cast<int>(xend);
-		int ypxl2 = ipart(yend - 0.5f);
-		float f2 = fpart(yend - 0.5f);
+		draw_slice(xpxl2, yend, xgap, 1.0f);
 
-		if (steep)
-		{
-			plot(ypxl2, xpxl2, (1.0f - f2 * 0.5f) * xgap);
-			plot(ypxl2 + 1, xpxl2, xgap);
-			plot(ypxl2 + 2, xpxl2, (0.5f + f2 * 0.5f) * xgap);
-		}
-		else
-		{
-			plot(xpxl2, ypxl2, (1.0f - f2 * 0.5f) * xgap);
-			plot(xpxl2, ypxl2 + 1, xgap);
-			plot(xpxl2, ypxl2 + 2, (0.5f + f2 * 0.5f) * xgap);
-		}
+		// Main loop with linear color interpolation
+		float span = static_cast<float>(xpxl2 - xpxl1);
+		float inv_span = (span > 0.0f) ? (1.0f / span) : 0.0f;
 
-		// Main loop
-		if (steep)
+		for (int x = xpxl1 + 1; x <= xpxl2; ++x)
 		{
-			for (int x = xpxl1 + 1; x <= xpxl2 - 1; ++x)
-			{
-				int y_base = ipart(intery - 0.5f);
-				float f = fpart(intery - 0.5f);
-				plot(y_base, x, 1.0f - f * 0.5f);
-				plot(y_base + 1, x, 1.0f);
-				plot(y_base + 2, x, 0.5f + f * 0.5f);
-				intery += gradient;
-			}
-		}
-		else
-		{
-			for (int x = xpxl1 + 1; x <= xpxl2 - 1; ++x)
-			{
-				int y_base = ipart(intery - 0.5f);
-				float f = fpart(intery - 0.5f);
-				plot(x, y_base, 1.0f - f * 0.5f);
-				plot(x, y_base + 1, 1.0f);
-				plot(x, y_base + 2, 0.5f + f * 0.5f);
-				intery += gradient;
-			}
+			float t = clamp((x - xpxl1) * inv_span, 0.0f, 1.0f);
+			draw_slice(x, intery, 1.0f, t);
+			intery += gradient;
 		}
 	}
 
@@ -521,17 +529,19 @@ class UltraVisualizerMT : public GenericVideoFilter
 		InterpolateSpline(x_left_pts, y_left_pts, height * 2, s_x_l, s_y_l);
 		InterpolateSpline(x_right_pts, y_right_pts, height * 2, s_x_r, s_y_r);
 
-		// Draw splines onto the internal buffer (with size_t underflow protection)
+		// Draw splines onto the internal buffer (with size_t underflow protection and linear gradient)
 		if (s_x_l.size() > 1 && s_x_r.size() > 1)
 		{
 			size_t count = (std::min)(s_x_l.size(), s_x_r.size());
 			for (size_t i = 0; i < count - 1; ++i)
 			{
-				float prog = (float)i / count;
-				BYTE r, g, b;
-				GetSpectrumColor(prog, r, g, b);
-				DrawLineAA(s_x_l[i], s_y_l[i], s_x_l[i + 1], s_y_l[i + 1], r, g, b, 255);
-				DrawLineAA(s_x_r[i], s_y_r[i], s_x_r[i + 1], s_y_r[i + 1], r, g, b, 255);
+				float prog0 = (float)i / count;
+				float prog1 = (float)(i + 1) / count;
+				BYTE r0, g0, b0, r1, g1, b1;
+				GetSpectrumColor(prog0, r0, g0, b0);
+				GetSpectrumColor(prog1, r1, g1, b1);
+				DrawLineAA(s_x_l[i], s_y_l[i], s_x_l[i + 1], s_y_l[i + 1], r0, g0, b0, r1, g1, b1, 255);
+				DrawLineAA(s_x_r[i], s_y_r[i], s_x_r[i + 1], s_y_r[i + 1], r0, g0, b0, r1, g1, b1, 255);
 			}
 		}
 
@@ -565,18 +575,25 @@ class UltraVisualizerMT : public GenericVideoFilter
 
 		if (s_p_x.size() > 1)
 		{
-			for (size_t i = 0; i < s_p_x.size() - 1; ++i)
-			{
-				float px = s_p_x[i];
-				float py = s_p_y[i];
-				// Dynamic color calculation based on distance to the center
+			auto get_phase_color = [&](float px, float py, BYTE& r, BYTE& g, BYTE& b) {
 				float dist_x = std::abs(px - cx) / cx;
 				float dist_y = std::abs(py - cy) / cy;
 				float dist_center = std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) / max_r;
-				BYTE r = static_cast<BYTE>(clamp(dist_y * 255.0f, 0.0f, 255.0f));
-				BYTE g = static_cast<BYTE>(clamp(std::sqrt((std::max)(0.0f, 1.0f - dist_center)) * 255.0f, 0.0f, 255.0f));
-				BYTE b = static_cast<BYTE>(clamp(dist_x * 255.0f, 0.0f, 255.0f));
-				DrawLineAA(px, py, s_p_x[i + 1], s_p_y[i + 1], r, g, b, 255);
+				r = static_cast<BYTE>(clamp(dist_y * 255.0f, 0.0f, 255.0f));
+				g = static_cast<BYTE>(clamp(std::sqrt((std::max)(0.0f, 1.0f - dist_center)) * 255.0f, 0.0f, 255.0f));
+				b = static_cast<BYTE>(clamp(dist_x * 255.0f, 0.0f, 255.0f));
+			};
+
+			BYTE r0, g0, b0, r1, g1, b1;
+			get_phase_color(s_p_x[0], s_p_y[0], r0, g0, b0);
+
+			for (size_t i = 0; i < s_p_x.size() - 1; ++i)
+			{
+				get_phase_color(s_p_x[i + 1], s_p_y[i + 1], r1, g1, b1);
+				DrawLineAA(s_p_x[i], s_p_y[i], s_p_x[i + 1], s_p_y[i + 1], r0, g0, b0, r1, g1, b1, 255);
+				r0 = r1;
+				g0 = g1;
+				b0 = b1;
 			}
 		}
 	}
@@ -605,7 +622,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 					}
 				}
 			}
-			});
+		});
 	}
 
 	// --- 4. Pixel feedback/decay of the internal clip (Liquid blur attenuation) ---
@@ -634,7 +651,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 					int l1 = clamp(x - 1, 0, width - 1), l2 = clamp(x - 2, 0, width - 1);
 					int r1 = clamp(x + 1, 0, width - 1), r2 = clamp(x + 2, 0, width - 1);
 					blend(up1[l1], up1[r1], dn1[l1], dn1[r1], up2[x], dn2[x], row[l2], row[r2], out[x]);
-					};
+				};
 
 				int inner_end = width - 2;
 				for (int x = 0; x < (std::min)(2, width); ++x)
@@ -644,7 +661,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 				for (int x = (std::max)(2, inner_end); x < width; ++x)
 					edge(x);
 			}
-			});
+		});
 		internal_buffer.swap(next_buffer);
 	}
 
@@ -688,11 +705,17 @@ class UltraVisualizerMT : public GenericVideoFilter
 	}
 
 public:
-	UltraVisualizerMT(PClip _child, int threads, IScriptEnvironment* env) : GenericVideoFilter(_child), pool(AutoThreads(threads))
+	UltraVisualizerMT(PClip _child, int threads, float thickness, IScriptEnvironment* env)
+		: GenericVideoFilter(_child), line_thickness(clamp(thickness, 0.1f, 64.0f)), pool(AutoThreads(threads))
 	{
 		if (!vi.HasVideo())
 		{
 			env->ThrowError("Ultra Visualizer: The clip must contain video!");
+		}
+
+		if (thickness <= 0.0f)
+		{
+			env->ThrowError("Ultra Visualizer: thickness must be greater than 0.0!");
 		}
 
 		// If the video is not in the required RGB24 format, force/convert it
@@ -764,13 +787,21 @@ public:
 };
 
 // Factory function for AviSynth+
-AVSValue Create_UltraVisMT(AVSValue args, void* user_data, IScriptEnvironment* env) { return new UltraVisualizerMT(args[0].AsClip(), args[1].AsInt(0), env); }
+AVSValue Create_UltraVisMT(AVSValue args, void* user_data, IScriptEnvironment* env)
+{
+	return new UltraVisualizerMT(
+		args[0].AsClip(),
+		args[1].AsInt(0),
+		static_cast<float>(args[2].AsFloat(2.0)),
+		env
+	);
+}
 
 // Plugin registration when loading the DLL
 const AVS_Linkage* AVS_linkage = 0;
 
 extern "C" __declspec(dllexport) const char* __stdcall AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
 	AVS_linkage = vectors;
-	env->AddFunction("UltraVisMT", "c[threads]i", Create_UltraVisMT, 0);
+	env->AddFunction("UltraVisMT", "c[threads]i[thickness]f", Create_UltraVisMT, 0);
 	return "Ultra Visualizer multi-threaded";
 }
