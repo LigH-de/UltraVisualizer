@@ -39,13 +39,19 @@ GetSpectrumColor(float progress, BYTE& r, BYTE& g, BYTE& b)
 	b = static_cast<BYTE>(clamp((cos(angle + 4.0f * (float)M_PI / 3.0f) * 0.5f + 0.5f) * 255.0f, 0.0f, 255.0f));
 }
 
-// Catmull-Rom Spline Interpolation
+// Catmull-Rom Spline Interpolation (reuses output vectors without reallocating capacity)
 void
 InterpolateSpline(const std::vector<float>& x_pts, const std::vector<float>& y_pts, int num_output, std::vector<float>& out_x, std::vector<float>& out_y)
 {
+	out_x.clear();
+	out_y.clear();
+
 	int n = (int)x_pts.size();
-	if (n < 2)
+	if (n < 2 || num_output < 2)
 		return;
+
+	out_x.reserve(num_output);
+	out_y.reserve(num_output);
 
 	for (int i = 0; i < num_output; ++i)
 	{
@@ -156,8 +162,8 @@ public:
 		for (int k = 0; k < N; ++k)
 			work[k] *= chirp[k] * scale;
 
-		mag_l.assign(M, 0.0f);
-		mag_r.assign(M, 0.0f);
+		mag_l.resize(M);
+		mag_r.resize(M);
 		for (int k = 0; k < M; ++k)
 		{
 			cplx zk = work[k];
@@ -255,6 +261,8 @@ class UltraVisualizerMT : public GenericVideoFilter
 	static const int WARMUP_FRAMES = 16;
 	// Largest forward gap that is rendered and kept instead of resyncing (out-of-order requests under Prefetch)
 	static const int MAX_AHEAD = 32;
+	// Maximum cached FFT plans to prevent unbounded memory growth on VFR clips
+	static const size_t MAX_PLANS = 16;
 
 	int width, height;
 	std::vector<PixelRGBA> internal_buffer; // Internal storage clip in RGBA32 format
@@ -263,6 +271,17 @@ class UltraVisualizerMT : public GenericVideoFilter
 	std::map<int, PVideoFrame> ahead; // Frames rendered ahead of a request
 	int next_n = 0;                   // Frame whose audio the internal buffer expects next
 	RowPool pool;
+
+	// Reusable scratch buffers to prevent per-frame heap allocations
+	std::vector<float> audio_buf;
+	std::vector<float> left_chan;
+	std::vector<float> right_chan;
+	std::vector<float> fft_left;
+	std::vector<float> fft_right;
+	std::vector<float> x_left_pts, y_left_pts, x_right_pts, y_right_pts;
+	std::vector<float> s_x_l, s_y_l, s_x_r, s_y_r;
+	std::vector<float> phase_x_pts, phase_y_pts;
+	std::vector<float> s_p_x, s_p_y;
 
 #ifdef ULTRAVIS_REFERENCE_DFT
 	// Discrete Fourier Transform (DFT) as a standalone FFT replacement for an audio sample window
@@ -310,33 +329,32 @@ class UltraVisualizerMT : public GenericVideoFilter
 #endif
 
 	void
-		ComputeSpectra(const std::vector<float>& left, const std::vector<float>& right, int num_samples, std::vector<float>& fft_left, std::vector<float>& fft_right)
+		ComputeSpectra(const std::vector<float>& left, const std::vector<float>& right, int num_samples, std::vector<float>& out_fft_left, std::vector<float>& out_fft_right)
 	{
 #ifdef ULTRAVIS_REFERENCE_DFT
-		ComputeDFT(left.data(), num_samples, fft_left);
-		ComputeDFT(right.data(), num_samples, fft_right);
+		ComputeDFT(left.data(), num_samples, out_fft_left);
+		ComputeDFT(right.data(), num_samples, out_fft_right);
 #else
 		auto it = plans.find(num_samples);
 		if (it == plans.end())
+		{
+			if (plans.size() >= MAX_PLANS)
+				plans.clear();
 			it = plans.emplace(num_samples, SpectrumPlan(num_samples)).first;
-		it->second.Compute(left.data(), right.data(), fft_left, fft_right);
+		}
+		it->second.Compute(left.data(), right.data(), out_fft_left, out_fft_right);
 #endif
 	}
 
-	// Function to draw a line with 2px thickness, anti-aliasing, and maximum blending
+	// Function to draw a line with ~2px thickness using Xiaolin Wu's anti-aliasing algorithm and maximum blending
 	void
-		DrawLineAA(int x0, int y0, int x1, int y1, BYTE r, BYTE g, BYTE b, BYTE a)
+		DrawLineAA(float x0, float y0, float x1, float y1, BYTE r, BYTE g, BYTE b, BYTE a)
 	{
-		int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-		int dy = abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-		int err = dx - dy, e2;
-		int ed = dx + dy == 0 ? 1 : (int)sqrt((float)dx * dx + (float)dy * dy);
-
 		auto plot = [&](int x, int y, float alpha_factor) {
-			if (x >= 0 && x < width && y >= 0 && y < height)
+			if (x >= 0 && x < width && y >= 0 && y < height && alpha_factor > 0.0f)
 			{
-				PixelRGBA& dest = internal_buffer[y * width + x];
-				BYTE target_a = static_cast<BYTE>(a * alpha_factor);
+				PixelRGBA& dest = internal_buffer[static_cast<size_t>(y) * width + x];
+				BYTE target_a = static_cast<BYTE>(clamp(a * alpha_factor, 0.0f, 255.0f));
 
 				// Blending using maximum for each channel separately
 				dest.r = (std::max)(dest.r, r);
@@ -346,35 +364,93 @@ class UltraVisualizerMT : public GenericVideoFilter
 			}
 			};
 
-		// Extension for 2 pixels thickness through parallel line plots
-		while (true)
+		auto ipart = [](float x) -> int { return static_cast<int>(std::floor(x)); };
+		auto fpart = [](float x) -> float { return x - std::floor(x); };
+		auto rfpart = [&](float x) -> float { return 1.0f - fpart(x); };
+
+		bool steep = std::abs(y1 - y0) > std::abs(x1 - x0);
+		if (steep)
 		{
-			float alpha = std::sqrt(1.0f - (ed == 0 ? 0.0f : (float)abs(err - dx + dy) / ed));
-			alpha = clamp(alpha, 0.0f, 1.0f);
+			std::swap(x0, y0);
+			std::swap(x1, y1);
+		}
+		if (x0 > x1)
+		{
+			std::swap(x0, x1);
+			std::swap(y0, y1);
+		}
 
-			plot(x0, y0, alpha);
-			// Line thickening
-			plot(x0, y0 - 1, alpha * 0.7f);
-			plot(x0, y0 + 1, alpha * 0.7f);
-			plot(x0 - 1, y0, alpha * 0.7f);
-			plot(x0 + 1, y0, alpha * 0.7f);
-			plot(x0 - 1, y0 - 1, alpha * 0.4f);
-			plot(x0 - 1, y0 + 1, alpha * 0.4f);
-			plot(x0 + 1, y0 - 1, alpha * 0.4f);
-			plot(x0 + 1, y0 + 1, alpha * 0.4f);
+		float dx = x1 - x0;
+		float dy = y1 - y0;
+		float gradient = (dx == 0.0f) ? 1.0f : dy / dx;
 
-			if (x0 == x1 && y0 == y1)
-				break;
-			e2 = 2 * err;
-			if (e2 >= -dy)
+		// Handle first endpoint
+		float xend = std::round(x0);
+		float yend = y0 + gradient * (xend - x0);
+		float xgap = rfpart(x0 + 0.5f);
+		int xpxl1 = static_cast<int>(xend);
+		int ypxl1 = ipart(yend - 0.5f);
+		float f1 = fpart(yend - 0.5f);
+
+		if (steep)
+		{
+			plot(ypxl1, xpxl1, (1.0f - f1 * 0.5f) * xgap);
+			plot(ypxl1 + 1, xpxl1, xgap);
+			plot(ypxl1 + 2, xpxl1, (0.5f + f1 * 0.5f) * xgap);
+		}
+		else
+		{
+			plot(xpxl1, ypxl1, (1.0f - f1 * 0.5f) * xgap);
+			plot(xpxl1, ypxl1 + 1, xgap);
+			plot(xpxl1, ypxl1 + 2, (0.5f + f1 * 0.5f) * xgap);
+		}
+
+		float intery = yend + gradient; // First y-intersection for the main loop
+
+		// Handle second endpoint
+		xend = std::round(x1);
+		yend = y1 + gradient * (xend - x1);
+		xgap = fpart(x1 + 0.5f);
+		int xpxl2 = static_cast<int>(xend);
+		int ypxl2 = ipart(yend - 0.5f);
+		float f2 = fpart(yend - 0.5f);
+
+		if (steep)
+		{
+			plot(ypxl2, xpxl2, (1.0f - f2 * 0.5f) * xgap);
+			plot(ypxl2 + 1, xpxl2, xgap);
+			plot(ypxl2 + 2, xpxl2, (0.5f + f2 * 0.5f) * xgap);
+		}
+		else
+		{
+			plot(xpxl2, ypxl2, (1.0f - f2 * 0.5f) * xgap);
+			plot(xpxl2, ypxl2 + 1, xgap);
+			plot(xpxl2, ypxl2 + 2, (0.5f + f2 * 0.5f) * xgap);
+		}
+
+		// Main loop
+		if (steep)
+		{
+			for (int x = xpxl1 + 1; x <= xpxl2 - 1; ++x)
 			{
-				err -= dy;
-				x0 += sx;
+				int y_base = ipart(intery - 0.5f);
+				float f = fpart(intery - 0.5f);
+				plot(y_base, x, 1.0f - f * 0.5f);
+				plot(y_base + 1, x, 1.0f);
+				plot(y_base + 2, x, 0.5f + f * 0.5f);
+				intery += gradient;
 			}
-			if (e2 <= dx)
+		}
+		else
+		{
+			for (int x = xpxl1 + 1; x <= xpxl2 - 1; ++x)
 			{
-				err += dx;
-				y0 += sy;
+				int y_base = ipart(intery - 0.5f);
+				float f = fpart(intery - 0.5f);
+				plot(x, y_base, 1.0f - f * 0.5f);
+				plot(x, y_base + 1, 1.0f);
+				plot(x, y_base + 2, 0.5f + f * 0.5f);
+				intery += gradient;
 			}
 		}
 	}
@@ -389,34 +465,43 @@ class UltraVisualizerMT : public GenericVideoFilter
 		// Determine the audio time window for this video frame
 		__int64 start_sample = (__int64)n * vi.audio_samples_per_second * vi.fps_denominator / vi.fps_numerator;
 		__int64 end_sample = (__int64)(n + 1) * vi.audio_samples_per_second * vi.fps_denominator / vi.fps_numerator;
-		int num_samples = static_cast<int> (end_sample - start_sample);
+		int num_samples = static_cast<int>(end_sample - start_sample);
 
 		if (num_samples <= 32) // Minimum number for a meaningful FFT
 			return;
 
-		std::vector<float> audio_buf(num_samples * vi.nchannels);
+		audio_buf.resize(static_cast<size_t>(num_samples) * vi.nchannels);
 		child->GetAudio(audio_buf.data(), start_sample, num_samples, env);
 
-		std::vector<float> left_chan(num_samples);
-		std::vector<float> right_chan(num_samples);
+		left_chan.resize(num_samples);
+		right_chan.resize(num_samples);
 		for (int i = 0; i < num_samples; ++i)
 		{
 			left_chan[i] = audio_buf[i * vi.nchannels + 0];
 			right_chan[i] = audio_buf[i * vi.nchannels + 1];
 		}
 
-		std::vector<float> fft_left, fft_right;
 		ComputeSpectra(left_chan, right_chan, num_samples, fft_left, fft_right);
 
 		// --- 1. Left and right border: Draw frequency splines ---
 		int bands = (int)fft_left.size();
-		std::vector<float> x_left_pts, y_left_pts, x_right_pts, y_right_pts;
+		if (bands < 2)
+			return;
+
+		x_left_pts.clear();
+		y_left_pts.clear();
+		x_right_pts.clear();
+		y_right_pts.clear();
+
+		x_left_pts.reserve(bands);
+		y_left_pts.reserve(bands);
+		x_right_pts.reserve(bands);
+		y_right_pts.reserve(bands);
 
 		for (int i = 0; i < bands; ++i)
 		{
 			float progress = (float)i / (bands - 1);
 			// Square stretching for vertical distribution (low frequencies bottom, high top)
-			// float norm_y = 1.0f - (progress * progress);
 			float norm_y = std::sqrt(progress);
 			float y_pos = norm_y * (height - 1);
 
@@ -433,23 +518,32 @@ class UltraVisualizerMT : public GenericVideoFilter
 		}
 
 		// Generation of interpolated points for smooth splines
-		std::vector<float> s_x_l, s_y_l, s_x_r, s_y_r;
 		InterpolateSpline(x_left_pts, y_left_pts, height * 2, s_x_l, s_y_l);
 		InterpolateSpline(x_right_pts, y_right_pts, height * 2, s_x_r, s_y_r);
 
-		// Draw splines onto the internal buffer
-		for (size_t i = 0; i < s_x_l.size() - 1; ++i)
+		// Draw splines onto the internal buffer (with size_t underflow protection)
+		if (s_x_l.size() > 1 && s_x_r.size() > 1)
 		{
-			float prog = (float)i / s_x_l.size();
-			BYTE r, g, b;
-			GetSpectrumColor(prog, r, g, b);
-			DrawLineAA((int)s_x_l[i], (int)s_y_l[i], (int)s_x_l[i + 1], (int)s_y_l[i + 1], r, g, b, 255);
-			DrawLineAA((int)s_x_r[i], (int)s_y_r[i], (int)s_x_r[i + 1], (int)s_y_r[i + 1], r, g, b, 255);
+			size_t count = (std::min)(s_x_l.size(), s_x_r.size());
+			for (size_t i = 0; i < count - 1; ++i)
+			{
+				float prog = (float)i / count;
+				BYTE r, g, b;
+				GetSpectrumColor(prog, r, g, b);
+				DrawLineAA(s_x_l[i], s_y_l[i], s_x_l[i + 1], s_y_l[i + 1], r, g, b, 255);
+				DrawLineAA(s_x_r[i], s_y_r[i], s_x_r[i + 1], s_y_r[i + 1], r, g, b, 255);
+			}
 		}
 
 		// --- 2. Middle: Phase display ---
-		std::vector<float> phase_x_pts, phase_y_pts;
+		phase_x_pts.clear();
+		phase_y_pts.clear();
+
 		int step = (std::max)(1, num_samples / 256); // Limiting control points for a smooth spline
+		size_t est_pts = static_cast<size_t>(num_samples / step) + 1;
+		phase_x_pts.reserve(est_pts);
+		phase_y_pts.reserve(est_pts);
+
 		float cx = width / 2.0f;
 		float cy = height / 2.0f;
 		float max_r = (std::min)(cx, cy) * 0.9f; // Scaling radius for the center
@@ -460,26 +554,30 @@ class UltraVisualizerMT : public GenericVideoFilter
 			float R = right_chan[i];
 
 			// Horizontal position: Sine of the difference (R - L)
-			float px = cx + sin(R - L) * /*max_r*/ cx * 0.6f;
+			float px = cx + sin(R - L) * cx * 0.6f;
 			// Vertical position: Sine of the sum (L + R)
-			float py = cy + sin(L + R) * /*max_r*/ cy * 0.8f;
+			float py = cy + sin(L + R) * cy * 0.8f;
 			phase_x_pts.push_back(px);
 			phase_y_pts.push_back(py);
 		}
-		std::vector<float> s_p_x, s_p_y;
+
 		InterpolateSpline(phase_x_pts, phase_y_pts, num_samples, s_p_x, s_p_y);
-		for (size_t i = 0; i < s_p_x.size() - 1; ++i)
+
+		if (s_p_x.size() > 1)
 		{
-			float px = s_p_x[i];
-			float py = s_p_y[i];
-			// Dynamic color calculation based on distance to the center
-			float dist_x = std::abs(px - cx) / cx;
-			float dist_y = std::abs(py - cy) / cy;
-			float dist_center = std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) / (max_r);
-			BYTE r = static_cast<BYTE>(clamp(dist_y * 255.0f, 0.0f, 255.0f));
-			BYTE g = static_cast<BYTE>(clamp(std::sqrt(1.0f - dist_center) * 255.0f, 0.0f, 255.0f));
-			BYTE b = static_cast<BYTE>(clamp(dist_x * 255.0f, 0.0f, 255.0f));
-			DrawLineAA((int)px, (int)py, (int)s_p_x[i + 1], (int)s_p_y[i + 1], r, g, b, 255);
+			for (size_t i = 0; i < s_p_x.size() - 1; ++i)
+			{
+				float px = s_p_x[i];
+				float py = s_p_y[i];
+				// Dynamic color calculation based on distance to the center
+				float dist_x = std::abs(px - cx) / cx;
+				float dist_y = std::abs(py - cy) / cy;
+				float dist_center = std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy)) / max_r;
+				BYTE r = static_cast<BYTE>(clamp(dist_y * 255.0f, 0.0f, 255.0f));
+				BYTE g = static_cast<BYTE>(clamp(std::sqrt((std::max)(0.0f, 1.0f - dist_center)) * 255.0f, 0.0f, 255.0f));
+				BYTE b = static_cast<BYTE>(clamp(dist_x * 255.0f, 0.0f, 255.0f));
+				DrawLineAA(px, py, s_p_x[i + 1], s_p_y[i + 1], r, g, b, 255);
+			}
 		}
 	}
 
@@ -492,8 +590,8 @@ class UltraVisualizerMT : public GenericVideoFilter
 		pool.Run(height, [&](int y0, int y1) {
 			for (int y = y0; y < y1; ++y)
 			{
-				BYTE* row = video_ptr + y * pitch;
-				const PixelRGBA* over_row = &internal_buffer[y * width];
+				BYTE* row = video_ptr + static_cast<size_t>(y) * pitch;
+				const PixelRGBA* over_row = &internal_buffer[static_cast<size_t>(y) * width];
 				for (int x = 0; x < width; ++x)
 				{
 					const PixelRGBA& overlay = over_row[x];
@@ -502,47 +600,47 @@ class UltraVisualizerMT : public GenericVideoFilter
 						float alpha_pct = overlay.a / 255.0f;
 						// Avisynth+ uses BGR byte order in memory for RGB24
 						row[x * 3 + 0] = static_cast<BYTE>(row[x * 3 + 0] * (1.0f - alpha_pct) + overlay.b * alpha_pct);
-						row[x * 3 + 1] = static_cast<BYTE> (row[x * 3 + 1] * (1.0f - alpha_pct) + overlay.g * alpha_pct);
-						row[x * 3 + 2] = static_cast<BYTE> (row[x * 3 + 2] * (1.0f - alpha_pct) + overlay.r * alpha_pct);
+						row[x * 3 + 1] = static_cast<BYTE>(row[x * 3 + 1] * (1.0f - alpha_pct) + overlay.g * alpha_pct);
+						row[x * 3 + 2] = static_cast<BYTE>(row[x * 3 + 2] * (1.0f - alpha_pct) + overlay.r * alpha_pct);
 					}
 				}
 			}
 			});
 	}
 
-	// --- 4. Pixel feedback/decay of the internal clip (Box blur attenuation) ---
+	// --- 4. Pixel feedback/decay of the internal clip (Liquid blur attenuation) ---
 	void
 		DecayBuffer()
 	{
-		auto blend = [](const PixelRGBA& top, const PixelRGBA& bottom, const PixelRGBA& left, const PixelRGBA& right,
+		auto blend = [](const PixelRGBA& top_left, const PixelRGBA& top_right, const PixelRGBA& bottom_left, const PixelRGBA& bottom_right,
 			const PixelRGBA& top2, const PixelRGBA& bottom2, const PixelRGBA& left2, const PixelRGBA& right2, PixelRGBA& out) {
-				out.r = (BYTE)(std::min)((top.r + bottom.r + left.r + right.r) / 8 + (top2.r + bottom2.r + left2.r + right2.r) / 8, 255);
-				out.g = (BYTE)(std::min)((top.g + bottom.g + left.g + right.g) / 8 + (top2.g + bottom2.g + left2.g + right2.g) / 8, 255);
-				out.b = (BYTE)(std::min)((top.b + bottom.b + left.b + right.b) / 8 + (top2.b + bottom2.b + left2.b + right2.b) / 8, 255);
-				out.a = (BYTE)(std::min)((top.a + bottom.a + left.a + right.a) / 10 + (top2.a + bottom2.a + left2.a + right2.a) / 12, 255);
+				out.r = (BYTE)(std::min)((top_left.r + top_right.r + bottom_left.r + bottom_right.r) / 8 + (top2.r + bottom2.r + left2.r + right2.r) / 8, 255);
+				out.g = (BYTE)(std::min)((top_left.g + top_right.g + bottom_left.g + bottom_right.g) / 8 + (top2.g + bottom2.g + left2.g + right2.g) / 8, 255);
+				out.b = (BYTE)(std::min)((top_left.b + top_right.b + bottom_left.b + bottom_right.b) / 8 + (top2.b + bottom2.b + left2.b + right2.b) / 8, 255);
+				out.a = (BYTE)(std::min)((top_left.a + top_right.a + bottom_left.a + bottom_right.a) / 10 + (top2.a + bottom2.a + left2.a + right2.a) / 12, 255);
 			};
 
 		pool.Run(height, [&](int y0, int y1) {
 			for (int y = y0; y < y1; ++y)
 			{
-				const PixelRGBA* row = &internal_buffer[y * width];
-				const PixelRGBA* up1 = &internal_buffer[clamp(y - 1, 0, height - 1) * width];
-				const PixelRGBA* up2 = &internal_buffer[clamp(y - 2, 0, height - 1) * width];
-				const PixelRGBA* dn1 = &internal_buffer[clamp(y + 1, 0, height - 1) * width];
-				const PixelRGBA* dn2 = &internal_buffer[clamp(y + 2, 0, height - 1) * width];
-				PixelRGBA* out = &next_buffer[y * width];
+				const PixelRGBA* row = &internal_buffer[static_cast<size_t>(y) * width];
+				const PixelRGBA* up1 = &internal_buffer[static_cast<size_t>(clamp(y - 1, 0, height - 1)) * width];
+				const PixelRGBA* up2 = &internal_buffer[static_cast<size_t>(clamp(y - 2, 0, height - 1)) * width];
+				const PixelRGBA* dn1 = &internal_buffer[static_cast<size_t>(clamp(y + 1, 0, height - 1)) * width];
+				const PixelRGBA* dn2 = &internal_buffer[static_cast<size_t>(clamp(y + 2, 0, height - 1)) * width];
+				PixelRGBA* out = &next_buffer[static_cast<size_t>(y) * width];
 
 				auto edge = [&](int x) {
 					int l1 = clamp(x - 1, 0, width - 1), l2 = clamp(x - 2, 0, width - 1);
 					int r1 = clamp(x + 1, 0, width - 1), r2 = clamp(x + 2, 0, width - 1);
-					blend(up1[x], dn1[x], row[l1], row[r1], up2[x], dn2[x], row[l2], row[r2], out[x]);
+					blend(up1[l1], up1[r1], dn1[l1], dn1[r1], up2[x], dn2[x], row[l2], row[r2], out[x]);
 					};
 
 				int inner_end = width - 2;
 				for (int x = 0; x < (std::min)(2, width); ++x)
 					edge(x);
 				for (int x = 2; x < inner_end; ++x)
-					blend(up1[x], dn1[x], row[x - 1], row[x + 1], up2[x], dn2[x], row[x - 2], row[x + 2], out[x]);
+					blend(up1[x - 1], up1[x + 1], dn1[x - 1], dn1[x + 1], up2[x], dn2[x], row[x - 2], row[x + 2], out[x]);
 				for (int x = (std::max)(2, inner_end); x < width; ++x)
 					edge(x);
 			}
@@ -627,9 +725,10 @@ public:
 		width = vi.width;
 		height = vi.height;
 
-		// Initialize the internal storage clip with transparency (Alpha = 0)
-		internal_buffer.resize(width * height, PixelRGBA{ 0, 0, 0, 0 });
-		next_buffer.resize(width * height);
+		// Safe size_t multiplication to avoid signed integer overflow on huge resolutions
+		size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+		internal_buffer.resize(pixel_count, PixelRGBA{ 0, 0, 0, 0 });
+		next_buffer.resize(pixel_count);
 	}
 
 	// The internal buffer carries state from frame to frame, so calls must not run concurrently
