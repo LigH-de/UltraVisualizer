@@ -579,6 +579,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 	std::vector<float> fft_right;
 	std::vector<float> x_left_pts, y_left_pts, x_right_pts, y_right_pts;
 	std::vector<float> s_x_l, s_y_l, s_x_r, s_y_r;
+	std::vector<PixelRGBA> spectrum_colors;
 	std::vector<float> phase_x_pts, phase_y_pts;
 	std::vector<float> s_p_x, s_p_y;
 
@@ -788,16 +789,22 @@ class UltraVisualizerMT : public GenericVideoFilter
 		// Draw splines onto the internal buffer (with size_t underflow protection and linear gradient)
 		if (s_x_l.size() > 1 && s_x_r.size() > 1)
 		{
-			size_t count = (std::min)(s_x_l.size(), s_x_r.size());
+			const size_t count = (std::min)(s_x_l.size(), s_x_r.size());
+			if (spectrum_colors.size() != count)
+			{
+				spectrum_colors.resize(count);
+				for (size_t i = 0; i < count; ++i)
+				{
+					PixelRGBA& color = spectrum_colors[i];
+					GetSpectrumColor(static_cast<float>(i) / count, color.r, color.g, color.b);
+				}
+			}
 			for (size_t i = 0; i < count - 1; ++i)
 			{
-				float prog0 = (float)i / count;
-				float prog1 = (float)(i + 1) / count;
-				BYTE r0, g0, b0, r1, g1, b1;
-				GetSpectrumColor(prog0, r0, g0, b0);
-				GetSpectrumColor(prog1, r1, g1, b1);
-				DrawLineAA(s_x_l[i], s_y_l[i], s_x_l[i + 1], s_y_l[i + 1], r0, g0, b0, r1, g1, b1, 255);
-				DrawLineAA(s_x_r[i], s_y_r[i], s_x_r[i + 1], s_y_r[i + 1], r0, g0, b0, r1, g1, b1, 255);
+				const PixelRGBA& from = spectrum_colors[i];
+				const PixelRGBA& to = spectrum_colors[i + 1];
+				DrawLineAA(s_x_l[i], s_y_l[i], s_x_l[i + 1], s_y_l[i + 1], from.r, from.g, from.b, to.r, to.g, to.b, 255);
+				DrawLineAA(s_x_r[i], s_y_r[i], s_x_r[i + 1], s_y_r[i + 1], from.r, from.g, from.b, to.r, to.g, to.b, 255);
 			}
 		}
 
