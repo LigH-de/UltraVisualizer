@@ -36,9 +36,25 @@ struct PixelRGBA
 // Process complete SIMD blocks in [2, end) and return the start of the scalar tail.
 using DecayInterior = int (*)(const PixelRGBA* row, const PixelRGBA* up1, const PixelRGBA* dn1,
 	const PixelRGBA* up2, const PixelRGBA* dn2, PixelRGBA* out, int end);
+using OverlayRow = void (*)(BYTE* dst, const PixelRGBA* overlay, int width);
+
+static void OverlayScalar(BYTE* dst, const PixelRGBA* overlay, int width)
+{
+	for (; width > 0; --width, dst += 3, ++overlay)
+	{
+		const int alpha = overlay->a;
+		if (alpha == 0)
+			continue;
+		const int inv = 255 - alpha;
+		// AviSynth RGB24 stores the three channels in BGR order.
+		dst[0] = static_cast<BYTE>((dst[0] * inv + overlay->b * alpha) / 255);
+		dst[1] = static_cast<BYTE>((dst[1] * inv + overlay->g * alpha) / 255);
+		dst[2] = static_cast<BYTE>((dst[2] * inv + overlay->r * alpha) / 255);
+	}
+}
 
 #ifdef ULTRAVIS_X86
-static_assert(sizeof(PixelRGBA) == 4, "SIMD blur requires packed RGBA");
+static_assert(sizeof(PixelRGBA) == 4, "SIMD kernels require packed RGBA");
 
 // Keep the rest of this translation unit at the target baseline (MSVC Win32: /arch:IA32).
 // MSVC lowers explicit intrinsics without a global /arch:AVX2 switch.
@@ -113,19 +129,116 @@ static UV_KERNEL("avx2") int DecayAvx2(const PixelRGBA* row, const PixelRGBA* up
 	return x;
 }
 
+// The weighted sum fits in an unsigned word (at most 255 * 255). In this
+// range floor(sum / 255) = (sum * 0x8081u) >> 23, using mulhi then >> 7.
+static UV_KERNEL("sse2") void OverlaySse2(BYTE* dst, const PixelRGBA* overlay, int width)
+{
+	const __m128i byte_mask = _mm_set1_epi16(255);
+	const __m128i first_pixel = _mm_setr_epi32(0xffffff, 0, 0xffffff, 0);
+	const __m128i second_pixel = _mm_setr_epi32(0, 0xffffff, 0, 0xffffff);
+	for (; width >= 16; width -= 16, dst += 48, overlay += 16)
+	{
+		const auto* src = reinterpret_cast<const __m128i*>(overlay);
+		const __m128i a = _mm_or_si128(_mm_loadu_si128(src), _mm_loadu_si128(src + 1));
+		const __m128i b = _mm_or_si128(_mm_loadu_si128(src + 2), _mm_loadu_si128(src + 3));
+		const __m128i clear = _mm_cmpeq_epi8(_mm_or_si128(a, b), _mm_setzero_si128());
+		// Every fourth byte is alpha. Skip the block only when all 16 are zero.
+		if ((_mm_movemask_epi8(clear) & 0x8888) == 0x8888)
+			continue;
+
+		for (int x = 0; x < 16; x += 4)
+		{
+			BYTE* out = dst + 3 * x;
+			// Load exactly 12 BGR bytes, then expand two pixels in each 64-bit lane.
+			const __m128i head = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(out));
+			const __m128i tail = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(out + 4));
+			const __m128i pairs = _mm_unpacklo_epi64(head, _mm_srli_epi64(tail, 16));
+			const __m128i bg = _mm_or_si128(_mm_and_si128(pairs, first_pixel),
+				_mm_and_si128(_mm_slli_epi64(pairs, 8), second_pixel));
+			const __m128i fg = _mm_loadu_si128(reinterpret_cast<const __m128i*>(overlay + x));
+			const __m128i a32 = _mm_srli_epi32(fg, 24);
+			const __m128i alpha = _mm_or_si128(a32, _mm_slli_epi32(a32, 16));
+			const __m128i inv = _mm_sub_epi16(byte_mask, alpha);
+			auto blend = [&](__m128i back, __m128i front) UV_TARGET("sse2") {
+				const __m128i sum = _mm_add_epi16(_mm_mullo_epi16(back, inv), _mm_mullo_epi16(front, alpha));
+				return _mm_srli_epi16(_mm_mulhi_epu16(sum, _mm_set1_epi16(static_cast<short>(0x8081))), 7);
+			};
+			const __m128i rb = _mm_or_si128(_mm_srli_epi32(fg, 16), _mm_slli_epi32(fg, 16));
+			const __m128i br_out = blend(_mm_and_si128(bg, byte_mask), _mm_and_si128(rb, byte_mask));
+			const __m128i g_out = blend(_mm_srli_epi16(bg, 8), _mm_srli_epi16(fg, 8));
+			const __m128i bgr = _mm_or_si128(br_out, _mm_slli_epi16(g_out, 8));
+			const __m128i packed = _mm_or_si128(_mm_and_si128(bgr, first_pixel),
+				_mm_srli_epi64(_mm_and_si128(bgr, second_pixel), 8));
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(out), packed);
+			const __m128i last = _mm_or_si128(_mm_srli_epi64(packed, 32),
+				_mm_slli_epi64(_mm_unpackhi_epi64(packed, packed), 16));
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(out + 4), last);
+		}
+	}
+	OverlayScalar(dst, overlay, width);
+}
+
+static UV_KERNEL("avx2") void OverlayAvx2(BYTE* dst, const PixelRGBA* overlay, int width)
+{
+	const __m256i byte_mask = _mm256_set1_epi16(255);
+	// Two overlapping loads cover exactly 24 BGR bytes. Each shuffle expands four pixels to RGBx.
+	const __m128i first_four = _mm_setr_epi8(2, 1, 0, -1,  5, 4, 3, -1,  8, 7, 6, -1,  11, 10, 9, -1);
+	const __m128i last_four = _mm_setr_epi8(6, 5, 4, -1,  9, 8, 7, -1,  12, 11, 10, -1,  15, 14, 13, -1);
+	const __m256i alpha_words = _mm256_broadcastsi128_si256(
+		_mm_setr_epi8(3, -1, 3, -1,  7, -1, 7, -1,  11, -1, 11, -1,  15, -1, 15, -1));
+	const __m256i pack_bgr = _mm256_broadcastsi128_si256(
+		_mm_setr_epi8(2, 1, 0,  6, 5, 4,  10, 9, 8,  14, 13, 12,  -1, -1, -1, -1));
+	for (; width >= 16; width -= 16, dst += 48, overlay += 16)
+	{
+		const auto* src = reinterpret_cast<const __m256i*>(overlay);
+		const __m256i combined = _mm256_or_si256(_mm256_loadu_si256(src), _mm256_loadu_si256(src + 1));
+		if (_mm256_testz_si256(combined, _mm256_slli_epi32(byte_mask, 24)))
+			continue;
+
+		for (int x = 0; x < 16; x += 8)
+		{
+			BYTE* out = dst + 3 * x;
+			const __m128i head = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(out)), first_four);
+			const __m128i tail = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(out + 8)), last_four);
+			const __m256i bg = _mm256_inserti128_si256(_mm256_castsi128_si256(head), tail, 1);
+			const __m256i fg = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(overlay + x));
+			const __m256i alpha = _mm256_shuffle_epi8(fg, alpha_words);
+			const __m256i inv = _mm256_sub_epi16(byte_mask, alpha);
+			auto blend = [&](__m256i back, __m256i front) UV_TARGET("avx2") {
+				const __m256i sum = _mm256_add_epi16(_mm256_mullo_epi16(back, inv), _mm256_mullo_epi16(front, alpha));
+				return _mm256_srli_epi16(_mm256_mulhi_epu16(sum, _mm256_set1_epi16(static_cast<short>(0x8081))), 7);
+			};
+			const __m256i rb = blend(_mm256_and_si256(bg, byte_mask), _mm256_and_si256(fg, byte_mask));
+			const __m256i g = blend(_mm256_srli_epi16(bg, 8), _mm256_srli_epi16(fg, 8));
+			const __m256i packed = _mm256_shuffle_epi8(_mm256_or_si256(rb, _mm256_slli_epi16(g, 8)), pack_bgr);
+			const __m128i lo = _mm256_castsi256_si128(packed), hi = _mm256_extracti128_si256(packed, 1);
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(out), _mm_or_si128(lo, _mm_slli_si128(hi, 12)));
+			_mm_storel_epi64(reinterpret_cast<__m128i*>(out + 16), _mm_srli_si128(hi, 4));
+		}
+	}
+	_mm256_zeroupper();
+	OverlayScalar(dst, overlay, width);
+}
+
 #undef UV_TARGET
 #undef UV_KERNEL
 #endif
 
-static DecayInterior SelectDecayInterior(int cpu_flags)
+struct PixelKernels
+{
+	DecayInterior decay;
+	OverlayRow overlay;
+};
+
+static PixelKernels SelectPixelKernels(int cpu_flags)
 {
 #ifdef ULTRAVIS_X86
 	if (cpu_flags & CPUF_AVX2)
-		return DecayAvx2;
+		return { DecayAvx2, OverlayAvx2 };
 	if (cpu_flags & CPUF_SSE2)
-		return DecaySse2;
+		return { DecaySse2, OverlaySse2 };
 #endif
-	return nullptr;
+	return { nullptr, OverlayScalar };
 }
 
 // Helper function for color calculation of the frequency splines via cosine functions
@@ -367,7 +480,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 
 	int width, height;
 	float line_thickness;
-	const DecayInterior decay_interior;
+	const PixelKernels kernels;
 	std::vector<PixelRGBA> internal_buffer; // Internal storage clip in RGBA32 format
 	std::vector<PixelRGBA> next_buffer;
 	std::map<int, SpectrumPlan> plans;
@@ -711,18 +824,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 			{
 				BYTE* row = video_ptr + static_cast<size_t>(y) * pitch;
 				const PixelRGBA* over_row = &internal_buffer[static_cast<size_t>(y) * width];
-				for (int x = 0; x < width; ++x)
-				{
-					const PixelRGBA& overlay = over_row[x];
-					if (overlay.a > 0)
-					{
-						float alpha_pct = overlay.a / 255.0f;
-						// Avisynth+ uses BGR byte order in memory for RGB24
-						row[x * 3 + 0] = static_cast<BYTE>(row[x * 3 + 0] * (1.0f - alpha_pct) + overlay.b * alpha_pct);
-						row[x * 3 + 1] = static_cast<BYTE>(row[x * 3 + 1] * (1.0f - alpha_pct) + overlay.g * alpha_pct);
-						row[x * 3 + 2] = static_cast<BYTE>(row[x * 3 + 2] * (1.0f - alpha_pct) + overlay.r * alpha_pct);
-					}
-				}
+				kernels.overlay(row, over_row, width);
 			}
 		});
 	}
@@ -758,7 +860,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 				int inner_end = width - 2;
 				for (int x = 0; x < (std::min)(2, width); ++x)
 					edge(x);
-				int x = decay_interior ? decay_interior(row, up1, dn1, up2, dn2, out, inner_end) : 2;
+				int x = kernels.decay ? kernels.decay(row, up1, dn1, up2, dn2, out, inner_end) : 2;
 				for (; x < inner_end; ++x)
 					blend(up1[x - 1], up1[x + 1], dn1[x - 1], dn1[x + 1], up2[x], dn2[x], row[x - 2], row[x + 2], out[x]);
 				for (int x = (std::max)(2, inner_end); x < width; ++x)
@@ -810,7 +912,7 @@ class UltraVisualizerMT : public GenericVideoFilter
 public:
 	UltraVisualizerMT(PClip _child, int threads, float thickness, IScriptEnvironment* env)
 		: GenericVideoFilter(_child), line_thickness(clamp(thickness, 0.1f, 64.0f)),
-		  decay_interior(SelectDecayInterior(env->GetCPUFlags())), pool(AutoThreads(threads))
+		  kernels(SelectPixelKernels(env->GetCPUFlags())), pool(AutoThreads(threads))
 	{
 		if (!vi.HasVideo())
 		{
