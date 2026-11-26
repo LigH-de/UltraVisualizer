@@ -292,13 +292,51 @@ static UV_KERNEL("sse2") void DrawSliceSse2(const LineSlice& slice, const LineGr
 	const __m128i channels = _mm_cvttps_epi32(rounded);
 	const __m128i words = _mm_packs_epi32(channels, _mm_setzero_si128());
 	const __m128i rgb = _mm_packus_epi16(words, _mm_setzero_si128());
-	slice.PlotPixels([&](PixelRGBA& dest, float coverage) UV_TARGET("sse2") {
-		const int a = static_cast<int>(clamp(slice.alpha * coverage, 0.0f, 255.0f));
-		const __m128i rgba = _mm_or_si128(rgb, _mm_slli_epi32(_mm_cvtsi32_si128(a), 24));
+	auto blend_pixel = [](PixelRGBA& dest, __m128i rgba) UV_TARGET("sse2") {
 		int pixel;
 		std::memcpy(&pixel, &dest, sizeof(pixel));
 		pixel = _mm_cvtsi128_si32(_mm_max_epu8(_mm_cvtsi32_si128(pixel), rgba));
 		std::memcpy(&dest, &pixel, sizeof(pixel));
+	};
+
+	// At the default line thickness, an unclipped slice spans three or four pixels.
+	if (slice.top >= 0.0f && slice.bottom < static_cast<float>(slice.limit))
+	{
+		const int first = static_cast<int>(slice.top);
+		const int last = static_cast<int>(slice.bottom);
+		const int count = last - first + 1;
+		if (count == 3 || count == 4)
+		{
+			// Round each weighted edge to float at the same point as PlotPixels on x87.
+			const float top = (1.0f - (slice.top - first)) * slice.weight;
+			const float bottom = (slice.bottom - last) * slice.weight;
+			const __m128 coverage = count == 3 ? _mm_setr_ps(top, slice.weight, bottom, 0.0f)
+			                                   : _mm_setr_ps(top, slice.weight, slice.weight, bottom);
+			const __m128i alpha = _mm_cvttps_epi32(_mm_mul_ps(coverage, _mm_set1_ps(slice.alpha)));
+			const __m128i rgba = _mm_or_si128(_mm_shuffle_epi32(rgb, 0), _mm_slli_epi32(alpha, 24));
+			// Positive coverage still contributes RGB when its alpha truncates to zero.
+			const __m128i pixels = _mm_and_si128(rgba, _mm_castps_si128(_mm_cmpgt_ps(coverage, _mm_setzero_ps())));
+			const size_t stride = slice.stride;
+			PixelRGBA* dst = slice.origin + first * stride;
+			if (stride == 1 && slice.limit - first >= 4)
+			{
+				const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst));
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm_max_epu8(old, pixels));
+			}
+			else
+			{
+				blend_pixel(dst[0], pixels);
+				blend_pixel(dst[stride], _mm_srli_si128(pixels, 4));
+				blend_pixel(dst[2 * stride], _mm_srli_si128(pixels, 8));
+				if (count == 4)
+					blend_pixel(dst[3 * stride], _mm_srli_si128(pixels, 12));
+			}
+			return;
+		}
+	}
+	slice.PlotPixels([&](PixelRGBA& dest, float coverage) UV_TARGET("sse2") {
+		const int a = static_cast<int>(clamp(slice.alpha * coverage, 0.0f, 255.0f));
+		blend_pixel(dest, _mm_or_si128(rgb, _mm_slli_epi32(_mm_cvtsi32_si128(a), 24)));
 	});
 }
 
